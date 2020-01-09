@@ -6,20 +6,38 @@ import torch.nn.functional as F
 # because it's slow on GPU.  instead it uses masks just like ye olde theano/tensorflow.
 # it doesn't use torch.nn.utils.rnn.pack_paded_sequence because reasons.
 
+"""
+encoder---decoder
 
-class BasicTranslationModel(nn.Module):
+           P(y|h)
+             ^
+ LSTM  ->   LSTM
+  ^          ^
+ biLSTM  -> LSTM
+  ^          ^
+input       y_prev
+"""
+
+class AdvancedTranslationModel(nn.Module):
     def __init__(self, inp_voc, out_voc,
                  emb_size, hid_size,):
+        
         super(self.__class__, self).__init__()
         self.inp_voc = inp_voc
         self.out_voc = out_voc
+        self.hid_size = hid_size
 
         self.emb_inp = nn.Embedding(len(inp_voc), emb_size)
         self.emb_out = nn.Embedding(len(out_voc), emb_size)
         
-        self.enc0 = nn.GRU(emb_size, hid_size, batch_first=True)
-        self.dec_start = nn.Linear(hid_size, hid_size)
-        self.dec0 = nn.GRUCell(emb_size, hid_size)
+        self.enc0 = nn.LSTM(emb_size, hid_size, batch_first=True, bidirectional=True)
+        self.enc1 = nn.LSTM(hid_size, hid_size, batch_first=True)
+
+        self.dec_start_0 = nn.Linear(hid_size, hid_size)
+        self.dec_start_1 = nn.Linear(hid_size, hid_size)
+        
+        self.dec0 = nn.LSTMCell(emb_size, hid_size)
+        self.dec1 = nn.LSTMCell(hid_size*2, hid_size)
         
         self.logits = nn.Linear(hid_size, len(out_voc))
 
@@ -30,15 +48,26 @@ class BasicTranslationModel(nn.Module):
         :return: a list of initial decoder state tensors
         """
         inp_emb = self.emb_inp(inp)
-        enc_seq, _ = self.enc0(inp_emb)
-
+        enc_seq_0, cx_0 = self.enc0(inp_emb)
+        print('enc_seq_0', enc_seq_0.size())
+        print('cx_0', cx_0[0][-1].size(), cx_0[1][-1].size())
+        
+        enc_seq_0 = enc_seq_0[:, :, :self.hid_size] + enc_seq_0[:, :, self.hid_size:]
+        enc_seq_1, cx_1 = self.enc1(enc_seq_0)
+        print('cx_1', cx_1[0].size(), cx_0[1].size())
+        
         # select last element w.r.t. mask
         end_index = infer_length(inp, self.inp_voc.eos_ix)
         end_index[end_index >= inp.shape[1]] = inp.shape[1] - 1
-        enc_last = enc_seq[range(0, enc_seq.shape[0]), end_index.detach(), :]
 
-        dec_start = self.dec_start(enc_last)
-        return [dec_start]
+        enc_last_0 = enc_seq_0[range(0, enc_seq_0.shape[0]), end_index.detach(), :]
+        print('enc_last_0', enc_last_0.size())
+        enc_last_1 = enc_seq_1[range(0, enc_seq_1.shape[0]), end_index.detach(), :]
+
+        dec_start_0 = self.dec_start_0(enc_last_0)
+        print('dec_start_0', dec_start_0.size())
+        dec_start_1 = self.dec_start_1(enc_last_1)
+        return [dec_start_0, cx_0, dec_start_1, cx_1]
 
     def decode(self, prev_state, prev_tokens, **flags):
         """
@@ -47,13 +76,16 @@ class BasicTranslationModel(nn.Module):
         :param prev_tokens: previous output tokens, an int vector of [batch_size]
         :return: a list of next decoder state tensors, a tensor of logits [batch,n_tokens]
         """
-        [prev_dec] = prev_state
+        [enc_last1, cx1 ,enc_last2, cx2] = prev_state
 
         prev_emb = self.emb_out(prev_tokens)
-        new_dec_state = self.dec0(prev_emb, prev_dec)
-        output_logits = self.logits(new_dec_state)
+        print('prev_emb', prev_emb.size())
+        new_dec_state1, cx1 = self.dec0(prev_emb, (cx1[0][-1], cx1[1][-1]))
+        new_dec_state2, cx2 = self.dec1(torch.cat((new_dec_state1, enc_last2),1))
+        
+        output_logits = self.logits(new_dec_state2)
 
-        return [new_dec_state], output_logits
+        return [new_dec_state1, cx1, new_dec_state2, cx2], output_logits
 
     def forward(self, inp, out, eps=1e-30, **flags):
         """
